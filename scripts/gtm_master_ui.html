@@ -722,6 +722,13 @@ PANELS.ask = (el) => {
     <button class="btn sec full" id="ask-preview">👁 Preview Prompt (row 1)</button>
     <div id="ask-prev"></div>
 
+    <div style="margin-top:12px;padding:10px;border:1px dashed var(--border);border-radius:8px;background:var(--bg2)">
+      <div style="font-weight:600;margin-bottom:4px">⚡ Instant (no AI) operations</div>
+      <div class="muted" style="font-size:12px;margin-bottom:8px">Exact-match jobs don't need Claude. Free, instant, 100% accurate.</div>
+      <button class="btn sec" id="ask-dedupe">🔍 Find Duplicates (mark yes/no)</button>
+      <button class="btn sec" id="ask-remove-dupes">🗑 Remove Duplicate Rows</button>
+    </div>
+
     <h4>Progress</h4>
     <div id="ask-steps"></div>
     <div id="ask-out"></div>
@@ -763,8 +770,77 @@ PANELS.ask = (el) => {
     $("ask-prev").innerHTML = `<div class="preview">${esc(p)}</div>`;
   };
   $("ask-run").onclick = runAsk;
+  $("ask-dedupe").onclick = () => runDedupe(false);
+  $("ask-remove-dupes").onclick = () => runDedupe(true);
   wireSaveBtn("Ask");
 };
+
+/* ─────────── Pure-JS duplicate finder (no API, no cost, instant) ─────────── */
+function runDedupe(removeMode) {
+  if (!state.data.rows.length) { toast("Load a dataset first", "err"); return; }
+  const feats = state.sel.features;
+  if (!feats.length) {
+    toast("Select at least one feature chip (e.g. Company + Name) to define a duplicate", "err");
+    return;
+  }
+
+  const colName = removeMode ? null : ($("ask-col").value.trim() || "Is_Duplicate");
+  const normalize = (v) => String(v==null?"":v).toLowerCase().trim().replace(/\s+/g," ");
+
+  const seen = new Map();   // key -> first row index
+  const groups = new Map(); // key -> count
+  state.data.rows.forEach((r, idx) => {
+    const key = feats.map(f => normalize(r[f])).join("||");
+    if (!seen.has(key)) seen.set(key, idx);
+    groups.set(key, (groups.get(key) || 0) + 1);
+  });
+
+  let uniqueCount = 0, dupeCount = 0;
+  if (!removeMode) {
+    // Mark mode — add Yes/No column
+    if (!state.data.cols.includes(colName)) state.data.cols.push(colName);
+    state.data.rows.forEach((r, idx) => {
+      const key = feats.map(f => normalize(r[f])).join("||");
+      const count = groups.get(key);
+      const isFirst = seen.get(key) === idx;
+      // "No" for the first occurrence, "Yes" for duplicates thereafter
+      r[colName] = count > 1 && !isFirst ? "Yes" : "No";
+      if (r[colName] === "Yes") dupeCount++; else uniqueCount++;
+    });
+    renderTable();
+    state.stageDone.add("ask");
+    toast(`Done · ${dupeCount} duplicates marked "Yes" · ${uniqueCount} unique rows marked "No"`, "ok");
+    $("ask-out").innerHTML = `
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:6px">✓ Dedupe complete</div>
+        <div>Based on: <b>${esc(feats.join(" + "))}</b></div>
+        <div>Column added: <code>${esc(colName)}</code></div>
+        <div style="margin-top:8px"><b>${dupeCount}</b> duplicate rows (first occurrence = No · subsequent = Yes)</div>
+        <div><b>${uniqueCount}</b> unique-first rows</div>
+        <div><b>${groups.size}</b> distinct combinations across ${state.data.rows.length} total rows</div>
+      </div>`;
+  } else {
+    // Remove mode — keep only first occurrence
+    if (!confirm(`Remove ${state.data.rows.length - groups.size} duplicate rows? This keeps only the first occurrence of each ${feats.join(" + ")} combination.`)) return;
+    const kept = [];
+    state.data.rows.forEach((r, idx) => {
+      const key = feats.map(f => normalize(r[f])).join("||");
+      if (seen.get(key) === idx) kept.push(r);
+    });
+    const removed = state.data.rows.length - kept.length;
+    state.data.rows = kept;
+    renderTable();
+    state.stageDone.add("ask");
+    toast(`Removed ${removed} duplicate rows · ${kept.length} unique rows remain`, "ok");
+    $("ask-out").innerHTML = `
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:6px">✓ Duplicates removed</div>
+        <div>Based on: <b>${esc(feats.join(" + "))}</b></div>
+        <div style="margin-top:8px"><b>${removed}</b> rows removed</div>
+        <div><b>${kept.length}</b> unique rows remain</div>
+      </div>`;
+  }
+}
 
 function buildAskPrompt(row, overrideQ) {
   const q = overrideQ != null ? overrideQ : $("ask-q").value.trim();
