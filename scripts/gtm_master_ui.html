@@ -916,8 +916,11 @@ async function runAsk() {
       const text = await anthropicCall(model, system, prompt, 4000, tools);
       progLog(`Response received · ${text.length} chars`);
       state.gtm.lastAnswer = text;
-      const parsed = parseMarkdownTable(text);
-      const tableInfo = parsed ? `<div class="muted" style="margin:6px 0">Detected table: <b>${parsed.rows.length}</b> rows × <b>${parsed.cols.length}</b> cols</div>` : "";
+      const all = parseAllMarkdownTables(text);
+      const parsed = all.merged;
+      const tableInfo = all.tables.length
+        ? `<div class="muted" style="margin:6px 0">Detected <b>${all.tables.length}</b> table${all.tables.length>1?"s":""} · <b>${all.merged.rows.length}</b> total rows · ${all.tables.map((t,i)=>`T${i+1}: ${t.rows.length}×${t.cols.length}`).join(" · ")}</div>`
+        : `<div class="muted" style="margin:6px 0">No markdown tables detected — answer is prose.</div>`;
       $("ask-out").innerHTML = `
         <div class="card">
           <pre style="white-space:pre-wrap;font-family:inherit;font-size:12px;max-height:400px;overflow:auto">${esc(text)}</pre>
@@ -1002,66 +1005,146 @@ async function runAsk() {
 
 
 /* ──────────── Markdown-table parser + save helpers ──────────── */
-function parseMarkdownTable(text) {
-  if (!text) return null;
+/* Parse ALL markdown tables in a Claude response. Returns:
+   {
+     tables: [{cols: [...], rows: [{col:val,...}]}, ...],  // each table separately
+     merged: {cols: [...], rows: [...]}                    // all tables unioned into one schema
+   }
+*/
+function parseAllMarkdownTables(text) {
+  if (!text) return { tables: [], merged: null };
   const lines = text.split(/\r?\n/);
-  // Find a block of ≥3 consecutive lines starting with | that looks like: header | separator | rows
-  let start = -1, end = -1;
-  for (let i = 0; i < lines.length - 1; i++) {
+  const splitRow = (l) => l.trim().replace(/^\|/,"").replace(/\|$/,"").split("|").map(c => c.trim());
+  const tables = [];
+  let i = 0;
+  while (i < lines.length - 1) {
     const a = lines[i].trim(), b = lines[i+1].trim();
     if (a.startsWith("|") && /^\|[\s:\-\|]+\|$/.test(b.replace(/\s/g,""))) {
-      start = i;
-      // walk forward while lines start with |
+      const start = i;
       let j = i + 2;
       while (j < lines.length && lines[j].trim().startsWith("|")) j++;
-      end = j;
-      break;
+      const cols = splitRow(lines[start]);
+      const rows = [];
+      for (let k = start + 2; k < j; k++) {
+        const cells = splitRow(lines[k]);
+        const obj = {};
+        cols.forEach((c, ix) => obj[c] = cells[ix] || "");
+        rows.push(obj);
+      }
+      if (rows.length) tables.push({ cols, rows });
+      i = j;
+    } else {
+      i++;
     }
   }
-  if (start < 0) return null;
-  const splitRow = (l) => l.trim().replace(/^\|/,"").replace(/\|$/,"").split("|").map(c => c.trim());
-  const cols = splitRow(lines[start]);
-  const rows = [];
-  for (let k = start + 2; k < end; k++) {
-    const cells = splitRow(lines[k]);
-    const obj = {};
-    cols.forEach((c, i) => obj[c] = cells[i] || "");
-    rows.push(obj);
-  }
-  return { cols, rows };
+  if (!tables.length) return { tables: [], merged: null };
+
+  // Union schema: merge all tables into one with combined column set
+  const allCols = [];
+  tables.forEach(t => t.cols.forEach(c => { if (!allCols.includes(c)) allCols.push(c); }));
+  const mergedRows = [];
+  tables.forEach((t, tIdx) => {
+    t.rows.forEach(r => {
+      const obj = {};
+      allCols.forEach(c => obj[c] = r[c] || "");
+      if (tables.length > 1) obj.__table__ = `Table ${tIdx + 1}`;
+      mergedRows.push(obj);
+    });
+  });
+  const mergedCols = tables.length > 1 ? [...allCols, "__table__"] : allCols;
+  return { tables, merged: { cols: mergedCols, rows: mergedRows } };
+}
+
+// Back-compat alias — returns the merged (combined) view so old callers keep working
+function parseMarkdownTable(text) {
+  const r = parseAllMarkdownTables(text);
+  return r.merged;
 }
 
 function saveAnswerAsXLSX(parsed) {
   const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.json_to_sheet(parsed.rows, { header: parsed.cols });
-  XLSX.utils.book_append_sheet(wb, ws, "Analysis");
-  // Also include the full raw answer on a second sheet for context
+  const all = parseAllMarkdownTables(state.gtm.lastAnswer || "");
+
+  // One sheet per detected table + a combined sheet if >1
+  if (all.tables.length > 1) {
+    const combined = XLSX.utils.json_to_sheet(all.merged.rows, { header: all.merged.cols });
+    XLSX.utils.book_append_sheet(wb, combined, "Combined");
+    all.tables.forEach((t, i) => {
+      const ws = XLSX.utils.json_to_sheet(t.rows, { header: t.cols });
+      XLSX.utils.book_append_sheet(wb, ws, `Table_${i+1}`);
+    });
+  } else if (all.tables.length === 1) {
+    const ws = XLSX.utils.json_to_sheet(all.tables[0].rows, { header: all.tables[0].cols });
+    XLSX.utils.book_append_sheet(wb, ws, "Analysis");
+  } else {
+    // No tables found — just dump raw
+    const ws = XLSX.utils.json_to_sheet(parsed?.rows || [], { header: parsed?.cols || ["answer"] });
+    XLSX.utils.book_append_sheet(wb, ws, "Analysis");
+  }
   if (state.gtm.lastAnswer) {
     const ws2 = XLSX.utils.aoa_to_sheet([["Raw Claude Answer"], ...state.gtm.lastAnswer.split(/\r?\n/).map(l => [l])]);
     XLSX.utils.book_append_sheet(wb, ws2, "Raw");
   }
   const fname = (state.data.fileName || "gtm").replace(/\.(xlsx|csv)$/i, "") + "_analysis.xlsx";
   XLSX.writeFile(wb, fname);
-  toast("Downloaded " + fname, "ok");
+  toast(`Downloaded ${fname} · ${all.tables.length} tables`, "ok");
 }
 
 async function saveAnswerToNewTab(parsed) {
-  if (!state.google.token) { toast("Connect Google in Keys stage first", "err"); return; }
+  if (!state.google.token) { toast("Connect Google in Keys stage first", "err", 6000); return; }
   const sid = state.data.sheetId || prompt("No sheet loaded. Paste target Google Sheet URL:");
   if (!sid) return;
   const sheetId = typeof sid === "string" && sid.includes("/") ? parseSheetId(sid) : sid;
-  const tabName = "Analysis_" + new Date().toISOString().slice(0,16).replace(/[:T]/g,"-");
+  const stamp = new Date().toISOString().slice(0,16).replace(/[:T]/g,"-");
+
+  const all = parseAllMarkdownTables(state.gtm.lastAnswer || "");
+  if (!all.tables.length) {
+    toast("No markdown tables detected in answer. Nothing to write.", "err", 6000);
+    return;
+  }
+
+  // Decide strategy: 1 table → single tab. Multiple → combined tab + per-table tabs.
+  const writePlan = [];
+  if (all.tables.length > 1) {
+    writePlan.push({ name: `Analysis_Combined_${stamp}`, cols: all.merged.cols, rows: all.merged.rows });
+    all.tables.forEach((t, i) => {
+      writePlan.push({ name: `Analysis_T${i+1}_${stamp}`, cols: t.cols, rows: t.rows });
+    });
+  } else {
+    const t = all.tables[0];
+    writePlan.push({ name: `Analysis_${stamp}`, cols: t.cols, rows: t.rows });
+  }
+
+  const results = [];
   try {
-    toast("Creating new tab…", "info");
-    await gFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
-      method:"POST", body: JSON.stringify({ requests:[{ addSheet:{ properties:{ title: tabName }}}] })
-    });
-    const values = [parsed.cols, ...parsed.rows.map(r => parsed.cols.map(c => r[c] || ""))];
-    await gFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(tabName)}?valueInputOption=RAW`, {
-      method:"PUT", body: JSON.stringify({ values })
-    });
-    toast(`Wrote ${parsed.rows.length} rows to tab "${tabName}"`, "ok");
-  } catch(e) { toast("Sheet write failed: " + e.message, "err"); }
+    toast(`Creating ${writePlan.length} tab${writePlan.length>1?"s":""}…`, "info", 4000);
+    for (const plan of writePlan) {
+      try {
+        await gFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+          method:"POST", body: JSON.stringify({ requests:[{ addSheet:{ properties:{ title: plan.name }}}] })
+        });
+        const values = [plan.cols, ...plan.rows.map(r => plan.cols.map(c => r[c] || ""))];
+        await gFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(plan.name)}?valueInputOption=RAW`, {
+          method:"PUT", body: JSON.stringify({ values })
+        });
+        results.push(`✓ "${plan.name}" · ${plan.rows.length} rows`);
+      } catch(e) {
+        results.push(`✗ "${plan.name}" failed: ${e.message.slice(0,80)}`);
+      }
+    }
+    toast(`Wrote ${writePlan.length} tab${writePlan.length>1?"s":""} · ${all.merged.rows.length} total rows`, "ok", 6000);
+    // Append visible result summary so user sees what happened
+    const out = $("ask-out");
+    if (out) {
+      const summary = document.createElement("div");
+      summary.className = "card";
+      summary.style.marginTop = "10px";
+      summary.innerHTML = `<div style="font-weight:600;margin-bottom:6px">📄 Saved to Google Sheet</div>${results.map(r => `<div>${esc(r)}</div>`).join("")}<div class="muted" style="margin-top:6px">Sheet ID: <code>${esc(sheetId)}</code></div>`;
+      out.appendChild(summary);
+    }
+  } catch(e) {
+    toast("Sheet write failed: " + e.message, "err", 8000);
+  }
 }
 
 /* ──────────── Stage: People (Apify) ──────────── */
