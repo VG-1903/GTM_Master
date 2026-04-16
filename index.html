@@ -413,7 +413,12 @@ PANELS.keys = (el) => {
     <div class="field">
       <label>Anthropic API Key <span class="pill ${state.keys.anthropic?'ok':'warn'}">${state.keys.anthropic?'set ('+(state.keys.anthropic.length)+' chars, starts '+esc(state.keys.anthropic.slice(0,10))+'…)':'missing'}</span></label>
       <input id="k-anth" type="password" placeholder="sk-ant-api03-..." value="${esc(state.keys.anthropic)}"/>
-      <div class="muted" style="margin-top:4px">Must start with <code>sk-ant-</code> · paste the whole token · click Save Keys below</div>
+      <div style="display:flex;gap:8px;margin-top:6px;align-items:center;flex-wrap:wrap">
+        <button class="btn sec" id="k-test-anth" type="button" style="font-size:12px">🧪 Test Key (real API ping)</button>
+        <button class="btn sec" id="k-show-anth" type="button" style="font-size:12px">👁 Show/Hide</button>
+        <span id="k-test-result" class="muted" style="font-size:12px"></span>
+      </div>
+      <div class="muted" style="margin-top:4px">Paste the whole token · invisible chars (zero-width spaces, NBSP) are auto-stripped · validation is permissive — the real check is the Test Key button</div>
     </div>
     <div class="field">
       <label>Apify Token <span class="pill ${state.keys.apify?'ok':'warn'}">${state.keys.apify?'set':'missing'}</span></label>
@@ -454,22 +459,69 @@ PANELS.keys = (el) => {
     $("k-saved-inline").innerHTML = `<span class="pill ok">✓ Keys already saved — will persist across reloads</span>`;
   }
 
+  // Strip zero-width + NBSP chars that sneak in from copy/paste
+  const cleanKey = s => (s||"").replace(/[\u200B-\u200D\uFEFF\u00A0\r\n\t]/g, "").trim();
+
+  // 👁 Show/Hide password toggle
+  $("k-show-anth").onclick = () => {
+    const inp = $("k-anth");
+    inp.type = inp.type === "password" ? "text" : "password";
+    $("k-show-anth").textContent = inp.type === "password" ? "👁 Show/Hide" : "🙈 Hide";
+  };
+
+  // 🧪 Test Key — real API ping, tells user exactly what's wrong
+  $("k-test-anth").onclick = async () => {
+    const key = cleanKey($("k-anth").value);
+    const res = $("k-test-result");
+    if (!key) { res.textContent = "❌ Paste a key first"; res.style.color = "var(--err)"; return; }
+    res.textContent = "… pinging Anthropic API";
+    res.style.color = "";
+    try {
+      const r = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": key,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: state.models.bulk,
+          max_tokens: 10,
+          messages: [{ role: "user", content: "Say 'ok'." }],
+        }),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        const got = (d.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("") || "(empty)";
+        res.innerHTML = `✅ <b>Valid</b> · model=${state.models.bulk} · replied: "${esc(got.slice(0,40))}"`;
+        res.style.color = "var(--ok, #2ea043)";
+      } else {
+        const err = (await r.text()).slice(0, 250);
+        res.innerHTML = `❌ <b>HTTP ${r.status}</b> — ${esc(err)}`;
+        res.style.color = "var(--err)";
+      }
+    } catch(e) {
+      res.innerHTML = `❌ <b>Network error</b> — ${esc(e.message)}`;
+      res.style.color = "var(--err)";
+    }
+  };
+
   $("k-save").onclick = () => {
     const prevAnth = state.keys.anthropic;
-    const newAnth = $("k-anth").value.trim();
-    const newApify = $("k-apify").value.trim();
+    const newAnth = cleanKey($("k-anth").value);
+    const newApify = cleanKey($("k-apify").value);
 
-    // Validate Anthropic key shape before accepting
-    if (newAnth && !newAnth.startsWith("sk-ant-")) {
-      toast("Anthropic key must start with 'sk-ant-'. Did you paste the right thing?", "err");
-      return;
-    }
-    if (newAnth && newAnth.length < 40) {
-      toast("Anthropic key looks too short (got "+newAnth.length+" chars). Paste the full token.", "err");
-      return;
+    // PERMISSIVE validation — soft warn only. The API is the real arbiter.
+    if (newAnth) {
+      if (!newAnth.startsWith("sk-ant-")) {
+        toast("Heads up: Anthropic keys usually start with 'sk-ant-'. Saving anyway — click 🧪 Test Key to verify.", "info");
+      } else if (newAnth.length < 40) {
+        toast("Heads up: key is only "+newAnth.length+" chars (usually 100+). Saving anyway — click 🧪 Test Key to verify.", "info");
+      }
     }
     if (newApify && !newApify.startsWith("apify_api_")) {
-      toast("Apify token usually starts with 'apify_api_' — double-check.", "err");
+      toast("Apify token usually starts with 'apify_api_' — double-check.", "info");
       // don't reject, just warn
     }
 
@@ -698,8 +750,9 @@ PANELS.ask = (el) => {
           <option value="list">Whole list — one answer (hypothesis/insight)</option>
         </select>
       </div>
-      <div class="field"><label>New column name (per-row mode)</label>
-        <input id="ask-col" type="text" value="${esc(last.col || "AI_Answer")}"/>
+      <div class="field"><label>Output column(s) <span class="muted" style="font-weight:normal">— comma-separated for multi-column output</span></label>
+        <input id="ask-col" type="text" placeholder="AI_Answer  OR  Industry, Tech_Stack, Stage" value="${esc(last.col || "AI_Answer")}"/>
+        <button class="btn sec" id="ask-suggest-cols" style="margin-top:6px;font-size:12px">✨ Auto-suggest columns from my prompt</button>
       </div>
     </div>
 
@@ -710,8 +763,21 @@ PANELS.ask = (el) => {
           <option value="${state.models.reasoning}">${state.models.reasoning} (smart)</option>
         </select>
       </div>
-      <div class="field"><label>Concurrency</label>
-        <input id="ask-conc" type="number" value="10" min="1" max="50"/>
+      <div class="field"><label>Concurrency <span class="muted" style="font-weight:normal">— parallel API calls</span></label>
+        <input id="ask-conc" type="number" value="${last.conc || 6}" min="1" max="50"/>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="field"><label>Batch size <span class="muted" style="font-weight:normal">— rows per API call (10 = 10× fewer calls, ~60% cheaper)</span></label>
+        <input id="ask-batch" type="number" value="${last.batch || 10}" min="1" max="30"/>
+      </div>
+      <div class="field"><label>&nbsp;</label>
+        <div class="muted" style="font-size:12px;padding-top:8px">
+          batch=1 → one row per call (old behavior, highest quality)<br/>
+          batch=10 → 10 rows per call (balanced, default)<br/>
+          batch=20+ → max throughput, may lose nuance
+        </div>
       </div>
     </div>
 
@@ -753,13 +819,14 @@ PANELS.ask = (el) => {
       col: $("ask-col").value,
       mode: $("ask-mode").value,
       web: $("ask-web").checked,
-      conc: parseInt($("ask-conc").value) || 10,
+      conc: parseInt($("ask-conc").value) || 6,
+      batch: parseInt($("ask-batch").value) || 10,
       model: $("ask-model").value,
     };
     state.concurrency = state.gtm.lastAsk.conc;
     persist();
   };
-  ["ask-q","ask-col","ask-mode","ask-web","ask-conc","ask-model"].forEach(id => {
+  ["ask-q","ask-col","ask-mode","ask-web","ask-conc","ask-batch","ask-model"].forEach(id => {
     const elx = $(id); if (!elx) return;
     elx.addEventListener("input", snap);
     elx.addEventListener("change", snap);
@@ -772,8 +839,81 @@ PANELS.ask = (el) => {
   $("ask-run").onclick = runAsk;
   $("ask-dedupe").onclick = () => runDedupe(false);
   $("ask-remove-dupes").onclick = () => runDedupe(true);
+  $("ask-suggest-cols").onclick = suggestColumns;
   wireSaveBtn("Ask");
 };
+
+/* Ask Haiku to propose column names based on the instruction */
+async function suggestColumns() {
+  const q = $("ask-q").value.trim();
+  if (!q) { toast("Type your instruction first", "err"); return; }
+  if (!state.keys.anthropic) { toast("Anthropic key required", "err"); return; }
+  const btn = $("ask-suggest-cols");
+  btn.textContent = "… thinking";
+  btn.disabled = true;
+  try {
+    const text = await anthropicCall(
+      state.models.bulk,
+      "You plan column schemas for CSV enrichment. Given an instruction, output ONLY a comma-separated list of 1-6 short snake_case column names that together answer the instruction. No explanation, no quotes, no brackets, just: Name1, Name2, Name3",
+      `Instruction: ${q}\n\nProposed column names:`,
+      100
+    );
+    // Clean response — strip anything that isn't the comma list
+    let cleaned = text.split("\n")[0].replace(/^[^A-Za-z_]+/, "").replace(/\.$/, "").trim();
+    // Validate it looks like a list
+    if (/^[A-Za-z0-9_, ]+$/.test(cleaned)) {
+      $("ask-col").value = cleaned;
+      $("ask-col").dispatchEvent(new Event("input"));
+      toast(`Suggested: ${cleaned}`, "ok");
+    } else {
+      toast("Got odd response, using first line anyway: " + cleaned.slice(0,60), "info");
+      $("ask-col").value = cleaned;
+    }
+  } catch(e) {
+    toast("Suggest failed: " + e.message.slice(0,100), "err");
+  } finally {
+    btn.textContent = "✨ Auto-suggest columns from my prompt";
+    btn.disabled = false;
+  }
+}
+
+/* Robust JSON extraction from Claude output (handles ```json fences, prose wrapping, arrays OR objects) */
+function extractJSON(text) {
+  if (!text) return null;
+  // Try direct parse
+  try { return JSON.parse(text); } catch(e){}
+  // Strip ```json ... ``` fences
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) { try { return JSON.parse(fence[1].trim()); } catch(e){} }
+  // Try array first (batch mode returns arrays) — widest [...] span
+  const aFirst = text.indexOf("[");
+  const aLast = text.lastIndexOf("]");
+  if (aFirst >= 0 && aLast > aFirst) {
+    const candidate = text.slice(aFirst, aLast + 1);
+    try { return JSON.parse(candidate); } catch(e){}
+  }
+  // Then object — widest {...} span
+  const oFirst = text.indexOf("{");
+  const oLast = text.lastIndexOf("}");
+  if (oFirst >= 0 && oLast > oFirst) {
+    const candidate = text.slice(oFirst, oLast + 1);
+    try { return JSON.parse(candidate); } catch(e){}
+  }
+  return null;
+}
+
+/* Build a single row's data snippet for batch prompts — only non-empty fields */
+function rowSnippet(row, idx) {
+  const feats = state.sel.features.length ? state.sel.features : state.data.cols.slice(0, 6);
+  const o = { __idx__: idx };
+  feats.forEach(f => {
+    const v = row[f];
+    if (v != null && v !== "" && String(v).toLowerCase() !== "nan") {
+      o[f] = String(v).slice(0, 250);
+    }
+  });
+  return o;
+}
 
 /* ─────────── Pure-JS duplicate finder (no API, no cost, instant) ─────────── */
 function runDedupe(removeMode) {
@@ -959,40 +1099,181 @@ async function runAsk() {
     return;
   }
 
-  // Per-row mode
-  if (!state.data.cols.includes(col)) state.data.cols.push(col);
+  // Per-row mode — BATCHED: N rows per API call for cost + consistency
+  const colNames = col.split(",").map(s => s.trim()).filter(Boolean);
+  if (colNames.length === 0) colNames.push("AI_Answer");
+  const multiCol = colNames.length > 1;
+  const batchSize = Math.max(1, Math.min(30, parseInt($("ask-batch").value) || 10));
+
+  // Register all target columns up-front so the table renders them
+  colNames.forEach(c => { if (!state.data.cols.includes(c)) state.data.cols.push(c); });
   renderTable();
   updateStep("ask-steps", 1, "done");
   updateStep("ask-steps", 2, "run");
 
   const rows = state.data.rows;
-  showProg("Running per-row…", rows.length);
-  progLog(`Per-row · model=${model} · conc=${conc} · web_search=${web?"on":"off"} · ${rows.length} rows`);
+
+  // ───── Build chunks of rows (absolute indices preserved) ─────
+  const chunks = [];
+  for (let i = 0; i < rows.length; i += batchSize) {
+    chunks.push({ start: i, rows: rows.slice(i, i + batchSize) });
+  }
+
+  // ───── System prompts ─────
+  const keysSig = colNames.map(c => JSON.stringify(c)).join(", ");
+  const batchSystem = `You are a senior GTM research analyst. You will receive a batch of N company rows. For EACH row, answer the user's instruction.
+
+STRICT OUTPUT RULES:
+- Return ONLY a raw JSON array of EXACTLY N objects, same order as input (index 0..N-1).
+- Each object MUST have EXACTLY these keys (no extras, no missing): ${keysSig}
+- Each value: short string under 200 chars. Prefer concrete nouns, stages, categories over hedged prose.
+- Make confident inferences from signals in the row. Use "Insufficient data" as a value ONLY when you truly cannot guess.
+- No markdown fences, no prose before or after. Output starts with [ and ends with ].`;
+
+  const singleSystem = multiCol
+    ? `You are a senior GTM research analyst. For the one company described, return ONLY a raw JSON object with EXACTLY these keys: ${keysSig}. Each value is a short string under 200 chars. Output starts with { and ends with }. No prose, no fences.`
+    : system;
+
+  showProg(`Running ${rows.length} rows in ${chunks.length} batch${chunks.length>1?"es":""} of ≤${batchSize}…`, rows.length);
+  progLog(`Per-row BATCHED · model=${model} · conc=${conc} · batch=${batchSize} · chunks=${chunks.length} · web_search=${web?"on":"off"} · cols=[${colNames.join(", ")}]`);
+
   state.running = true;
   let errCount = 0;
-  try {
-    await pool(rows, conc, async (row, idx) => {
-      if (!state.running) return;
-      try {
-        const prompt = buildAskPrompt(row, q);
-        const ans = await anthropicCall(model, system, prompt, web ? 1024 : 300, tools);
-        row[col] = ans;
-        markCell(idx, col);
-      } catch(e) {
-        row[col] = "[ERR] " + e.message.slice(0,80);
-        errCount++;
-        if (errCount <= 3) progLog(`Row ${idx+1} failed: ${e.message.slice(0,120)}`);
-        if (errCount === 4) progLog(`… (further errors suppressed)`);
+  let parseFailCount = 0;
+  let batchFallbackCount = 0;
+
+  // ───── Single-row fallback (reused when a batch fails to parse) ─────
+  async function processSingleRow(row, absIdx) {
+    try {
+      const prompt = buildAskPrompt(row, q);
+      const maxTok = multiCol ? (web ? 1400 : 600) : (web ? 1024 : 300);
+      const ans = await anthropicCall(model, singleSystem, prompt, maxTok, tools);
+      if (multiCol) {
+        const obj = extractJSON(ans);
+        if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+          colNames.forEach(c => {
+            const v = obj[c];
+            row[c] = (v == null) ? "" : (typeof v === "string" ? v : JSON.stringify(v));
+            markCell(absIdx, c);
+          });
+        } else {
+          parseFailCount++;
+          row[colNames[0]] = "[NO JSON] " + ans.slice(0, 300);
+          for (let k = 1; k < colNames.length; k++) row[colNames[k]] = "";
+          markCell(absIdx, colNames[0]);
+        }
+      } else {
+        row[colNames[0]] = ans;
+        markCell(absIdx, colNames[0]);
       }
-      tickProg();
+    } catch(e) {
+      row[colNames[0]] = "[ERR] " + e.message.slice(0,80);
+      errCount++;
+    }
+    tickProg();
+  }
+
+  try {
+    await pool(chunks, conc, async (chunk, chunkIdx) => {
+      if (!state.running) return;
+      const N = chunk.rows.length;
+
+      // ── Fast path: single-row batches skip the JSON-array ceremony ──
+      if (N === 1) {
+        await processSingleRow(chunk.rows[0], chunk.start);
+        return;
+      }
+
+      // ── Build batch prompt with compact row snippets ──
+      const snippets = chunk.rows.map((r, i) => rowSnippet(r, i));
+      const batchPrompt = `Instruction: ${q}
+
+Rows (${N} items, indexed 0..${N-1}):
+${JSON.stringify(snippets, null, 2)}
+
+Return a JSON array of EXACTLY ${N} objects now (one per row, same order, keys = ${keysSig}):`;
+
+      // Token budget: ~200 tokens/row + 300 overhead, capped by model
+      const maxTok = Math.min(
+        web ? 8000 : 4000,
+        N * (multiCol ? 250 : 180) + 400
+      );
+
+      try {
+        const ans = await anthropicCall(model, batchSystem, batchPrompt, maxTok, tools);
+        const arr = extractJSON(ans);
+
+        if (Array.isArray(arr) && arr.length >= N) {
+          // ── Happy path: assign each result to its row ──
+          chunk.rows.forEach((row, i) => {
+            const abs = chunk.start + i;
+            const obj = arr[i];
+            if (obj && typeof obj === "object") {
+              colNames.forEach(c => {
+                const v = obj[c];
+                row[c] = (v == null) ? "" : (typeof v === "string" ? v : JSON.stringify(v));
+                markCell(abs, c);
+              });
+            } else {
+              parseFailCount++;
+              row[colNames[0]] = "[missing in batch]";
+              markCell(abs, colNames[0]);
+            }
+            tickProg();
+          });
+        } else if (Array.isArray(arr) && arr.length > 0 && arr.length < N) {
+          // Partial array — use what we got, mark the rest as missing
+          progLog(`Batch ${chunkIdx+1}: got ${arr.length}/${N} objects, filling partial`);
+          chunk.rows.forEach((row, i) => {
+            const abs = chunk.start + i;
+            const obj = arr[i];
+            if (obj && typeof obj === "object") {
+              colNames.forEach(c => {
+                const v = obj[c];
+                row[c] = (v == null) ? "" : (typeof v === "string" ? v : JSON.stringify(v));
+                markCell(abs, c);
+              });
+            } else {
+              parseFailCount++;
+              row[colNames[0]] = "[missing in batch]";
+              markCell(abs, colNames[0]);
+            }
+            tickProg();
+          });
+        } else {
+          // ── Parse failed: fall back to one call per row for this chunk ──
+          batchFallbackCount++;
+          if (batchFallbackCount <= 2) progLog(`Batch ${chunkIdx+1}: JSON parse failed, falling back to single-row (${N} extra calls)`);
+          for (let i = 0; i < N; i++) {
+            if (!state.running) break;
+            await processSingleRow(chunk.rows[i], chunk.start + i);
+          }
+        }
+      } catch(e) {
+        // Whole-batch API failure: retry each row individually
+        batchFallbackCount++;
+        if (batchFallbackCount <= 2) progLog(`Batch ${chunkIdx+1} API call failed (${e.message.slice(0,80)}) — retrying row-by-row`);
+        for (let i = 0; i < N; i++) {
+          if (!state.running) break;
+          await processSingleRow(chunk.rows[i], chunk.start + i);
+        }
+      }
     });
+
     state.stageDone.add("ask");
     updateStep("ask-steps", 2, "done");
     updateStep("ask-steps", 3, "done");
     renderRail();
     setStatus("Done", "ok");
-    const msg = errCount ? `Answered ${rows.length-errCount}/${rows.length} rows → "${col}" · ${errCount} errors` : `Answered ${rows.length} rows → "${col}"`;
-    toast(msg, errCount ? "err" : "ok");
+    const okCount = rows.length - errCount - parseFailCount;
+    const colLabel = multiCol ? `[${colNames.join(", ")}]` : `"${colNames[0]}"`;
+    let msg = `Answered ${okCount}/${rows.length} rows → ${colLabel}`;
+    if (batchFallbackCount) msg += ` · ${batchFallbackCount} batch fallback${batchFallbackCount>1?"s":""}`;
+    if (errCount) msg += ` · ${errCount} errors`;
+    if (parseFailCount) msg += ` · ${parseFailCount} parse issues`;
+    const apiCalls = chunks.length + batchFallbackCount * batchSize; // rough estimate
+    progLog(`Done · ~${apiCalls} API calls (vs ${rows.length} w/o batching · ${Math.round((1 - apiCalls/rows.length)*100)}% saved)`);
+    toast(msg, (errCount || parseFailCount) ? "err" : "ok");
   } catch(e) {
     updateStep("ask-steps", 2, "err");
     toast("Per-row run crashed: "+e.message.slice(0,120), "err");
