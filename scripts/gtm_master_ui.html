@@ -855,20 +855,20 @@ PANELS.ask = (el) => {
           <option value="${state.models.reasoning}">${state.models.reasoning} (smart)</option>
         </select>
       </div>
-      <div class="field"><label>Concurrency <span class="muted" style="font-weight:normal">— parallel API calls</span></label>
-        <input id="ask-conc" type="number" value="${last.conc || 6}" min="1" max="50"/>
+      <div class="field"><label>Concurrency <span class="muted" style="font-weight:normal">— parallel API calls (lower if you hit 429)</span></label>
+        <input id="ask-conc" type="number" value="${last.conc || 3}" min="1" max="50"/>
       </div>
     </div>
 
     <div class="row">
-      <div class="field"><label>Batch size <span class="muted" style="font-weight:normal">— rows per API call (10 = 10× fewer calls, ~60% cheaper)</span></label>
-        <input id="ask-batch" type="number" value="${last.batch || 10}" min="1" max="30"/>
+      <div class="field"><label>Batch size <span class="muted" style="font-weight:normal">— rows per API call</span></label>
+        <input id="ask-batch" type="number" value="${last.batch || 8}" min="1" max="30"/>
       </div>
       <div class="field"><label>&nbsp;</label>
         <div class="muted" style="font-size:12px;padding-top:8px">
-          batch=1 → one row per call (old behavior, highest quality)<br/>
-          batch=10 → 10 rows per call (balanced, default)<br/>
-          batch=20+ → max throughput, may lose nuance
+          <b>Tier 1 Anthropic?</b> Use conc=2, batch=5 to avoid 429s.<br/>
+          <b>Tier 2+?</b> conc=5–10, batch=10 works well.<br/>
+          App honors Anthropic's <code>retry-after</code> — just wait if throttled.
         </div>
       </div>
     </div>
@@ -2204,48 +2204,135 @@ async function pool(items, n, fn) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Anthropic API call — single helper used everywhere
-═══════════════════════════════════════════════════════════════ */
+   Anthropic API call — shared, rate-limit-aware, jitter-backed
+
+   Why this exists:
+   When many workers fire in parallel and Anthropic returns 429, a naïve
+   per-worker exponential backoff produces a "thundering herd" — all workers
+   retry at 1s, all hit 429 again, then all retry at 2s, etc.
+
+   Fix: ONE module-level cooldown deadline (`rateLimit.until`). When any worker
+   sees a 429, it bumps the shared deadline. Every worker checks the deadline
+   BEFORE issuing its next request. Anthropic's `retry-after` header is honored
+   when present. Jitter is added so restart bursts don't re-sync.
+   ═══════════════════════════════════════════════════════════════ */
+const rateLimit = {
+  until: 0,              // epoch ms — no one calls before this time
+  consecutive429: 0,     // if it keeps happening, widen the cooldown
+  totalBackoffMs: 0,     // diagnostics
+};
+
+function setCooldown(ms, reason) {
+  const now = Date.now();
+  // bump, never shorten — a worker with later data wins
+  rateLimit.until = Math.max(rateLimit.until, now + ms);
+  rateLimit.totalBackoffMs += ms;
+  const endsIn = Math.round((rateLimit.until - now) / 1000);
+  progLog(`⏸ rate-limit cooldown · ${endsIn}s · ${reason}`);
+  // Tiny badge in the progress label so the user sees it
+  const pl = $("prog-label");
+  if (pl) {
+    const existing = pl.querySelector(".rl-badge");
+    const label = `⏸ cooling ${endsIn}s`;
+    if (existing) existing.textContent = label;
+    else pl.insertAdjacentHTML("beforeend", `<span class="rl-badge pill warn" style="margin-left:8px">${label}</span>`);
+    // Auto-clear badge when cooldown ends
+    setTimeout(() => { const b = pl.querySelector(".rl-badge"); if (b && Date.now() >= rateLimit.until) b.remove(); }, endsIn * 1000 + 200);
+  }
+}
+
+async function respectCooldown() {
+  const now = Date.now();
+  if (rateLimit.until > now) await sleep(rateLimit.until - now + Math.floor(Math.random() * 250));
+}
+
+// Parse Anthropic's rate-limit hints. `retry-after` is the canonical source.
+// Fall back to `anthropic-ratelimit-*-reset` if present, then to an adaptive default.
+function computeRetryWait(response, attempt) {
+  const ra = parseFloat(response.headers.get("retry-after") || "");
+  if (!isNaN(ra) && ra > 0) return Math.min(ra * 1000, 60000);   // cap at 60s
+  // ISO timestamps — e.g. "2024-..."; compute delta to now
+  const reset = response.headers.get("anthropic-ratelimit-requests-reset")
+             || response.headers.get("anthropic-ratelimit-tokens-reset");
+  if (reset) {
+    const ms = new Date(reset).getTime() - Date.now();
+    if (ms > 0) return Math.min(ms, 60000);
+  }
+  // Adaptive default: grow fast when 429s keep coming
+  const base = 2000 * Math.pow(1.7, attempt);           // 2s → 3.4 → 5.8 → 9.8 → 16.6
+  const burstPenalty = 1000 * Math.min(rateLimit.consecutive429, 5);  // up to +5s
+  const jitter = Math.random() * 500;
+  return Math.min(base + burstPenalty + jitter, 45000);
+}
+
 async function anthropicCall(model, system, userPrompt, maxTokens=300, tools=null) {
   if (!state.keys.anthropic) throw new Error("no anthropic key");
   const body = {
     model, max_tokens: maxTokens, temperature: 0.15,
-    system, messages: [{ role:"user", content: userPrompt }]
+    system, messages: [{ role:"user", content: userPrompt }],
   };
   if (tools) body.tools = tools;
-  // Web search calls can be slow — allow 180s; regular calls 60s
+  // Web search calls can be slow — 180s; regular 60s
   const TIMEOUT_MS = tools ? 180000 : 60000;
-  for (let attempt=0; attempt<4; attempt++) {
+  const MAX_ATTEMPTS = 8;
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    // Respect any shared cooldown before even opening the request
+    await respectCooldown();
+    if (!state.running && state.progress && state.progress.total) {
+      // user pressed Stop mid-cooldown
+      throw new Error("aborted during cooldown");
+    }
+
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+
     try {
       const r = await fetch("https://api.anthropic.com/v1/messages", {
-        method:"POST",
-        headers:{
+        method: "POST",
+        headers: {
           "x-api-key": state.keys.anthropic,
-          "anthropic-version":"2023-06-01",
-          "anthropic-dangerous-direct-browser-access":"true",
-          "Content-Type":"application/json"
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+          "Content-Type": "application/json",
         },
         body: JSON.stringify(body),
         signal: ctrl.signal,
       });
       clearTimeout(timer);
-      if (r.status === 429 || r.status >= 500) {
-        const wait = 1000 * Math.pow(2, attempt);
-        progLog(`HTTP ${r.status} — retrying in ${wait/1000}s (attempt ${attempt+1}/4)`);
+
+      // ── 429: rate limited ──
+      if (r.status === 429) {
+        rateLimit.consecutive429++;
+        const wait = computeRetryWait(r, attempt);
+        setCooldown(wait, `HTTP 429 (attempt ${attempt+1}/${MAX_ATTEMPTS})`);
+        if (attempt === MAX_ATTEMPTS - 1) {
+          throw new Error(`Rate limited after ${MAX_ATTEMPTS} attempts. Try lowering concurrency/batch size, or wait a minute.`);
+        }
+        continue;
+      }
+
+      // ── 5xx: server-side, retry with backoff but no global cooldown ──
+      if (r.status >= 500) {
+        const wait = 1500 * Math.pow(2, attempt) + Math.random() * 500;
+        progLog(`HTTP ${r.status} server error — retrying in ${Math.round(wait/1000)}s (attempt ${attempt+1}/${MAX_ATTEMPTS})`);
         await sleep(wait);
         continue;
       }
+
+      // ── 4xx other: surface the error body so user sees what's wrong ──
       if (!r.ok) {
-        const errText = (await r.text()).slice(0,250);
-        throw new Error("HTTP "+r.status+" "+errText);
+        const errText = (await r.text()).slice(0, 300);
+        throw new Error(`HTTP ${r.status} ${errText}`);
       }
+
+      // ── Success: reset 429 streak counter ──
+      rateLimit.consecutive429 = 0;
+
       const d = await r.json();
-      const text = (d.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("").trim();
+      const text = (d.content||[]).filter(b => b.type === "text").map(b => b.text).join("").trim();
       if (!text) {
-        // Fallback: show stop_reason + block types so user sees WHY it's empty
-        const types = (d.content||[]).map(b=>b.type).join(", ") || "none";
+        const types = (d.content||[]).map(b => b.type).join(", ") || "none";
         return `[EMPTY RESPONSE] stop_reason=${d.stop_reason||"?"} · blocks=${types} · Try increasing max_tokens or rephrasing.`;
       }
       return text;
@@ -2253,12 +2340,15 @@ async function anthropicCall(model, system, userPrompt, maxTokens=300, tools=nul
       clearTimeout(timer);
       if (e.name === "AbortError") {
         progLog(`Request timed out after ${TIMEOUT_MS/1000}s`);
-        if (attempt===3) throw new Error(`Timeout after ${TIMEOUT_MS/1000}s × 4 attempts. Anthropic API slow or web_search stuck.`);
+        if (attempt === MAX_ATTEMPTS - 1) throw new Error(`Timeout after ${TIMEOUT_MS/1000}s × ${MAX_ATTEMPTS} attempts.`);
+        await sleep(2000 + Math.random() * 500);
+      } else if (e.message === "aborted during cooldown") {
+        throw e;
       } else {
-        progLog(`Error: ${e.message}`);
-        if (attempt===3) throw e;
+        progLog(`Network error: ${e.message}`);
+        if (attempt === MAX_ATTEMPTS - 1) throw e;
+        await sleep(2000 * Math.pow(1.5, attempt) + Math.random() * 500);
       }
-      await sleep(1000 * Math.pow(2, attempt));
     }
   }
   throw new Error("max retries exceeded");
