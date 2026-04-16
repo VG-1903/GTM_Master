@@ -235,15 +235,24 @@ const state = {
   stageDone: new Set(),
 };
 
-/* Load persisted keys */
+/* Load persisted keys + UI state */
 try {
   const saved = JSON.parse(localStorage.getItem(LS) || "{}");
   if (saved.keys) Object.assign(state.keys, saved.keys);
   if (saved.models) Object.assign(state.models, saved.models);
+  if (saved.gtm) Object.assign(state.gtm, saved.gtm);
+  if (saved.sel && Array.isArray(saved.sel.features)) state.sel.features = saved.sel.features;
+  if (typeof saved.concurrency === "number") state.concurrency = saved.concurrency;
 } catch(e){}
 
 function persist() {
-  localStorage.setItem(LS, JSON.stringify({ keys: state.keys, models: state.models }));
+  localStorage.setItem(LS, JSON.stringify({
+    keys: state.keys,
+    models: state.models,
+    gtm: { lastAsk: state.gtm.lastAsk || null, hypothesis: state.gtm.hypothesis, segments: state.gtm.segments },
+    sel: { features: state.sel.features },
+    concurrency: state.concurrency,
+  }));
 }
 
 /* ── Stage definitions ─────────────────────────────────────────── */
@@ -402,16 +411,17 @@ PANELS.keys = (el) => {
     <p class="muted" style="margin-bottom:14px">Stored in <code>localStorage</code> — never sent anywhere except the provider's own API. Use at your own risk; clear with <b>Reset</b>.</p>
 
     <div class="field">
-      <label>Anthropic API Key <span class="pill ${state.keys.anthropic?'ok':'warn'}">${state.keys.anthropic?'set':'missing'}</span></label>
-      <input id="k-anth" type="password" placeholder="sk-ant-api03-..." value="${state.keys.anthropic}"/>
+      <label>Anthropic API Key <span class="pill ${state.keys.anthropic?'ok':'warn'}">${state.keys.anthropic?'set ('+(state.keys.anthropic.length)+' chars, starts '+esc(state.keys.anthropic.slice(0,10))+'…)':'missing'}</span></label>
+      <input id="k-anth" type="password" placeholder="sk-ant-api03-..." value="${esc(state.keys.anthropic)}"/>
+      <div class="muted" style="margin-top:4px">Must start with <code>sk-ant-</code> · paste the whole token · click Save Keys below</div>
     </div>
     <div class="field">
       <label>Apify Token <span class="pill ${state.keys.apify?'ok':'warn'}">${state.keys.apify?'set':'missing'}</span></label>
-      <input id="k-apify" type="password" placeholder="apify_api_..." value="${state.keys.apify}"/>
+      <input id="k-apify" type="password" placeholder="apify_api_..." value="${esc(state.keys.apify)}"/>
     </div>
     <div class="field">
       <label>Google OAuth Client ID <span class="pill ${state.keys.googleClientId?'ok':'warn'}">${state.keys.googleClientId?'set':'optional'}</span></label>
-      <input id="k-gcid" type="text" placeholder="xxxxx.apps.googleusercontent.com" value="${state.keys.googleClientId}"/>
+      <input id="k-gcid" type="text" placeholder="xxxxx.apps.googleusercontent.com" value="${esc(state.keys.googleClientId)}"/>
       <div class="muted" style="margin-top:4px">Create at console.cloud.google.com → APIs & Services → Credentials → OAuth client → Web application. Add <code>${location.origin || 'file://'}</code> as Authorized JS origin.</div>
     </div>
 
@@ -446,8 +456,25 @@ PANELS.keys = (el) => {
 
   $("k-save").onclick = () => {
     const prevAnth = state.keys.anthropic;
-    state.keys.anthropic = $("k-anth").value.trim();
-    state.keys.apify = $("k-apify").value.trim();
+    const newAnth = $("k-anth").value.trim();
+    const newApify = $("k-apify").value.trim();
+
+    // Validate Anthropic key shape before accepting
+    if (newAnth && !newAnth.startsWith("sk-ant-")) {
+      toast("Anthropic key must start with 'sk-ant-'. Did you paste the right thing?", "err");
+      return;
+    }
+    if (newAnth && newAnth.length < 40) {
+      toast("Anthropic key looks too short (got "+newAnth.length+" chars). Paste the full token.", "err");
+      return;
+    }
+    if (newApify && !newApify.startsWith("apify_api_")) {
+      toast("Apify token usually starts with 'apify_api_' — double-check.", "err");
+      // don't reject, just warn
+    }
+
+    state.keys.anthropic = newAnth;
+    state.keys.apify = newApify;
     state.keys.googleClientId = $("k-gcid").value.trim();
     state.models.bulk = $("k-bulk").value;
     state.models.reasoning = $("k-reason").value;
@@ -709,6 +736,28 @@ PANELS.ask = (el) => {
     { label:"Write result" },
   ]);
   if (last.mode) $("ask-mode").value = last.mode;
+  if (last.conc) $("ask-conc").value = last.conc;
+  if (last.model) $("ask-model").value = last.model;
+
+  // Auto-persist form inputs on every change — no data loss when switching stages
+  const snap = () => {
+    state.gtm.lastAsk = {
+      q: $("ask-q").value,
+      col: $("ask-col").value,
+      mode: $("ask-mode").value,
+      web: $("ask-web").checked,
+      conc: parseInt($("ask-conc").value) || 10,
+      model: $("ask-model").value,
+    };
+    state.concurrency = state.gtm.lastAsk.conc;
+    persist();
+  };
+  ["ask-q","ask-col","ask-mode","ask-web","ask-conc","ask-model"].forEach(id => {
+    const elx = $(id); if (!elx) return;
+    elx.addEventListener("input", snap);
+    elx.addEventListener("change", snap);
+  });
+
   $("ask-preview").onclick = () => {
     const p = buildAskPrompt(state.data.rows[0]);
     $("ask-prev").innerHTML = `<div class="preview">${esc(p)}</div>`;
@@ -720,8 +769,16 @@ PANELS.ask = (el) => {
 function buildAskPrompt(row, overrideQ) {
   const q = overrideQ != null ? overrideQ : $("ask-q").value.trim();
   const feats = state.sel.features.length ? state.sel.features : state.data.cols.slice(0, 6);
-  const data = feats.map(f => `- ${f}: ${String(row[f]||'N/A').slice(0,500)}`).join("\n");
-  return `Company Data:\n${data}\n\nInstruction: ${q}`;
+  // Only include features that actually have a value — sending "N/A" noise makes Claude bail
+  const lines = feats
+    .map(f => {
+      const v = row[f];
+      if (v == null || v === "" || String(v).toLowerCase() === "nan") return null;
+      return `- ${f}: ${String(v).slice(0,500)}`;
+    })
+    .filter(Boolean);
+  const data = lines.length ? lines.join("\n") : "- (no structured fields provided — use the company name and your general knowledge to infer)";
+  return `Company Data:\n${data}\n\nInstruction: ${q}\n\nEven if some fields are missing, make a confident best-effort inference. Do NOT respond with 'Insufficient data' unless truly nothing is known.`;
 }
 
 async function decideMode(question) {
@@ -763,8 +820,8 @@ async function runAsk() {
 
   const tools = web ? [{ type:"web_search_20250305", name:"web_search" }] : null;
   const system = mode === "list"
-    ? "You are a senior GTM strategist. Analyze the provided sample and answer the user's instruction in structured plain text. Be specific, not generic."
-    : "You are a senior GTM research analyst. Answer the instruction concisely for this one company. If data insufficient, respond exactly: Insufficient data.";
+    ? "You are a senior GTM strategist. Analyze the provided sample and answer the user's instruction in structured plain text. Be specific, not generic. Where the user asks for a table of results, return a clean markdown table with headers."
+    : "You are a senior GTM research analyst. Answer the instruction concisely for this one company. Make confident inferences from whatever signals you have — company name alone is often enough to make an educated guess. Only reply 'Insufficient data' if you truly cannot even guess (this should be rare).";
 
   if (mode === "list") {
     // Run ONCE on a sample of the list
@@ -1108,6 +1165,24 @@ async function pushToSheet() {
 function renderFeatureChips(id) {
   const el = $(id);
   if (!el) return;
+  // Smart-default: if user hasn't picked any features yet, auto-select the high-signal ones
+  if (!state.sel.features.length && state.data.cols.length) {
+    const patterns = [/^name$/i, /^company/i, /^organi[sz]ation$/i, /^brand$/i,
+                      /^description$/i, /^about$/i, /^summary$/i, /^bio$/i, /^overview$/i,
+                      /^industry$/i, /^sector$/i, /^category$/i, /^vertical$/i,
+                      /^website$/i, /^domain$/i, /^url$/i, /^homepage$/i,
+                      /^employees?$/i, /^size$/i, /^headcount$/i, /^stage$/i, /^funding$/i,
+                      /^title$/i, /^role$/i];
+    state.data.cols.forEach(c => {
+      if (patterns.some(p => p.test(c))) state.sel.features.push(c);
+    });
+    // If still nothing matched (generic dataset), grab first 4 non-ID columns
+    if (!state.sel.features.length) {
+      const skip = /^(id|uid|guid|index|_id|timestamp|created|updated|modified|row|rownum)/i;
+      state.sel.features = state.data.cols.filter(c => !skip.test(c)).slice(0, 4);
+    }
+    persist();
+  }
   el.innerHTML = state.data.cols.map(c => `<div class="chip${state.sel.features.includes(c)?' on':''}" data-c="${esc(c)}">${esc(c)}</div>`).join("");
   el.querySelectorAll(".chip").forEach(ch => {
     ch.onclick = () => {
@@ -1115,6 +1190,7 @@ function renderFeatureChips(id) {
       const i = state.sel.features.indexOf(c);
       if (i>=0) state.sel.features.splice(i,1); else state.sel.features.push(c);
       ch.classList.toggle("on");
+      persist();
     };
   });
 }
