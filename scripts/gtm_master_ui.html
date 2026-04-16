@@ -778,13 +778,30 @@ async function runAsk() {
     const prompt = `Instruction: ${q}\n\nSample rows (up to 25):\n${JSON.stringify(sample, null, 2)}\n\nFull dataset: ${state.data.rows.length} rows. Available columns: ${state.data.cols.join(", ")}`;
     showProg("Claude thinking…", 1);
     try {
-      const text = await anthropicCall(model, system, prompt, 1500, tools);
-      $("ask-out").innerHTML = `<div class="card"><pre style="white-space:pre-wrap;font-family:inherit;font-size:12px">${esc(text)}</pre></div>`;
+      const text = await anthropicCall(model, system, prompt, 4000, tools);
+      state.gtm.lastAnswer = text;
+      const parsed = parseMarkdownTable(text);
+      const tableInfo = parsed ? `<div class="muted" style="margin:6px 0">Detected table: <b>${parsed.rows.length}</b> rows × <b>${parsed.cols.length}</b> cols</div>` : "";
+      $("ask-out").innerHTML = `
+        <div class="card">
+          <pre style="white-space:pre-wrap;font-family:inherit;font-size:12px;max-height:400px;overflow:auto">${esc(text)}</pre>
+          ${tableInfo}
+          <div class="row" style="margin-top:10px">
+            <button class="btn sec" id="ans-copy">📋 Copy Text</button>
+            <button class="btn sec" id="ans-xlsx" ${parsed?'':'disabled'}>↓ Download as XLSX</button>
+            <button class="btn" id="ans-sheet" ${parsed && state.google.token?'':'disabled'}>${state.google.token?'↑ Save to New Google Sheet Tab':'Connect Google first'}</button>
+          </div>
+        </div>`;
+      $("ans-copy").onclick = () => { navigator.clipboard.writeText(text); toast("Copied", "ok"); };
+      if (parsed) {
+        $("ans-xlsx").onclick = () => saveAnswerAsXLSX(parsed);
+        if (state.google.token) $("ans-sheet").onclick = () => saveAnswerToNewTab(parsed);
+      }
       updateStep("ask-steps", 2, "done");
       updateStep("ask-steps", 3, "done");
       state.stageDone.add("ask");
       renderRail();
-      toast("Answer ready", "ok");
+      toast(parsed ? `Answer ready · ${parsed.rows.length}-row table detected` : "Answer ready", "ok");
     } catch(e) { toast("Failed: "+e.message, "err"); }
     hideProg();
     return;
@@ -819,6 +836,69 @@ async function runAsk() {
   toast(`Answered ${rows.length} rows → "${col}"`, "ok");
 }
 
+
+/* ──────────── Markdown-table parser + save helpers ──────────── */
+function parseMarkdownTable(text) {
+  if (!text) return null;
+  const lines = text.split(/\r?\n/);
+  // Find a block of ≥3 consecutive lines starting with | that looks like: header | separator | rows
+  let start = -1, end = -1;
+  for (let i = 0; i < lines.length - 1; i++) {
+    const a = lines[i].trim(), b = lines[i+1].trim();
+    if (a.startsWith("|") && /^\|[\s:\-\|]+\|$/.test(b.replace(/\s/g,""))) {
+      start = i;
+      // walk forward while lines start with |
+      let j = i + 2;
+      while (j < lines.length && lines[j].trim().startsWith("|")) j++;
+      end = j;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  const splitRow = (l) => l.trim().replace(/^\|/,"").replace(/\|$/,"").split("|").map(c => c.trim());
+  const cols = splitRow(lines[start]);
+  const rows = [];
+  for (let k = start + 2; k < end; k++) {
+    const cells = splitRow(lines[k]);
+    const obj = {};
+    cols.forEach((c, i) => obj[c] = cells[i] || "");
+    rows.push(obj);
+  }
+  return { cols, rows };
+}
+
+function saveAnswerAsXLSX(parsed) {
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.json_to_sheet(parsed.rows, { header: parsed.cols });
+  XLSX.utils.book_append_sheet(wb, ws, "Analysis");
+  // Also include the full raw answer on a second sheet for context
+  if (state.gtm.lastAnswer) {
+    const ws2 = XLSX.utils.aoa_to_sheet([["Raw Claude Answer"], ...state.gtm.lastAnswer.split(/\r?\n/).map(l => [l])]);
+    XLSX.utils.book_append_sheet(wb, ws2, "Raw");
+  }
+  const fname = (state.data.fileName || "gtm").replace(/\.(xlsx|csv)$/i, "") + "_analysis.xlsx";
+  XLSX.writeFile(wb, fname);
+  toast("Downloaded " + fname, "ok");
+}
+
+async function saveAnswerToNewTab(parsed) {
+  if (!state.google.token) { toast("Connect Google in Keys stage first", "err"); return; }
+  const sid = state.data.sheetId || prompt("No sheet loaded. Paste target Google Sheet URL:");
+  if (!sid) return;
+  const sheetId = typeof sid === "string" && sid.includes("/") ? parseSheetId(sid) : sid;
+  const tabName = "Analysis_" + new Date().toISOString().slice(0,16).replace(/[:T]/g,"-");
+  try {
+    toast("Creating new tab…", "info");
+    await gFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method:"POST", body: JSON.stringify({ requests:[{ addSheet:{ properties:{ title: tabName }}}] })
+    });
+    const values = [parsed.cols, ...parsed.rows.map(r => parsed.cols.map(c => r[c] || ""))];
+    await gFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(tabName)}?valueInputOption=RAW`, {
+      method:"PUT", body: JSON.stringify({ values })
+    });
+    toast(`Wrote ${parsed.rows.length} rows to tab "${tabName}"`, "ok");
+  } catch(e) { toast("Sheet write failed: " + e.message, "err"); }
+}
 
 /* ──────────── Stage: People (Apify) ──────────── */
 PANELS.people = (el) => {
