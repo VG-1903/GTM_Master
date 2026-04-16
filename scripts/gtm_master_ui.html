@@ -915,6 +915,26 @@ function rowSnippet(row, idx) {
   return o;
 }
 
+/* Case-/space-insensitive key lookup — Claude often changes "Tech_Stack" → "tech_stack" etc. */
+function pickKey(obj, target) {
+  if (obj == null || typeof obj !== "object") return undefined;
+  if (target in obj) return obj[target];
+  const norm = s => String(s).toLowerCase().replace(/[\s_\-]+/g, "");
+  const want = norm(target);
+  for (const k of Object.keys(obj)) {
+    if (norm(k) === want) return obj[k];
+  }
+  return undefined;
+}
+
+/* Stringify any value safely for a sheet cell */
+function cellify(v) {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  return JSON.stringify(v);
+}
+
 /* ─────────── Pure-JS duplicate finder (no API, no cost, instant) ─────────── */
 function runDedupe(removeMode) {
   if (!state.data.rows.length) { toast("Load a dataset first", "err"); return; }
@@ -1151,16 +1171,26 @@ STRICT OUTPUT RULES:
       if (multiCol) {
         const obj = extractJSON(ans);
         if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+          let filled = 0;
           colNames.forEach(c => {
-            const v = obj[c];
-            row[c] = (v == null) ? "" : (typeof v === "string" ? v : JSON.stringify(v));
+            const v = pickKey(obj, c);
+            row[c] = cellify(v);
+            if (row[c]) filled++;
             markCell(absIdx, c);
           });
+          if (filled === 0) {
+            // Keys completely mismatched — dump raw so user sees what Claude said
+            parseFailCount++;
+            row[colNames[0]] = "[KEY MISMATCH] Claude returned: " + JSON.stringify(obj).slice(0, 250);
+            markCell(absIdx, colNames[0]);
+            if (parseFailCount <= 2) progLog(`Row ${absIdx+1}: JSON parsed but keys didn't match [${colNames.join(",")}] — got keys [${Object.keys(obj).join(",")}]`);
+          }
         } else {
           parseFailCount++;
           row[colNames[0]] = "[NO JSON] " + ans.slice(0, 300);
           for (let k = 1; k < colNames.length; k++) row[colNames[k]] = "";
           markCell(absIdx, colNames[0]);
+          if (parseFailCount <= 2) progLog(`Row ${absIdx+1}: no parseable JSON, raw: ${ans.slice(0, 200)}`);
         }
       } else {
         row[colNames[0]] = ans;
@@ -1172,6 +1202,9 @@ STRICT OUTPUT RULES:
     }
     tickProg();
   }
+
+  // Log the first batch's raw response so user can diagnose "nothing written"
+  let debugLoggedFirstBatch = false;
 
   try {
     await pool(chunks, conc, async (chunk, chunkIdx) => {
@@ -1201,49 +1234,54 @@ Return a JSON array of EXACTLY ${N} objects now (one per row, same order, keys =
 
       try {
         const ans = await anthropicCall(model, batchSystem, batchPrompt, maxTok, tools);
+
+        // Log first batch raw output so user can see what Claude actually returned
+        if (!debugLoggedFirstBatch) {
+          debugLoggedFirstBatch = true;
+          progLog(`First batch raw (${ans.length} chars): ${ans.slice(0, 300)}${ans.length>300?"…":""}`);
+        }
+
         const arr = extractJSON(ans);
+
+        // Helper to write one row from one object (both full-array and partial-array paths)
+        const writeRow = (row, i, obj) => {
+          const abs = chunk.start + i;
+          if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+            let filled = 0;
+            colNames.forEach(c => {
+              const v = pickKey(obj, c);
+              const s = cellify(v);
+              row[c] = s;
+              if (s) filled++;
+              markCell(abs, c);
+            });
+            if (filled === 0) {
+              parseFailCount++;
+              row[colNames[0]] = "[KEY MISMATCH] " + JSON.stringify(obj).slice(0, 250);
+              markCell(abs, colNames[0]);
+              if (parseFailCount === 1) progLog(`Batch ${chunkIdx+1} row ${abs+1}: keys returned [${Object.keys(obj).join(",")}] don't match asked [${colNames.join(",")}]`);
+            }
+          } else {
+            parseFailCount++;
+            row[colNames[0]] = "[missing in batch]";
+            markCell(abs, colNames[0]);
+          }
+          tickProg();
+        };
 
         if (Array.isArray(arr) && arr.length >= N) {
           // ── Happy path: assign each result to its row ──
-          chunk.rows.forEach((row, i) => {
-            const abs = chunk.start + i;
-            const obj = arr[i];
-            if (obj && typeof obj === "object") {
-              colNames.forEach(c => {
-                const v = obj[c];
-                row[c] = (v == null) ? "" : (typeof v === "string" ? v : JSON.stringify(v));
-                markCell(abs, c);
-              });
-            } else {
-              parseFailCount++;
-              row[colNames[0]] = "[missing in batch]";
-              markCell(abs, colNames[0]);
-            }
-            tickProg();
-          });
+          chunk.rows.forEach((row, i) => writeRow(row, i, arr[i]));
         } else if (Array.isArray(arr) && arr.length > 0 && arr.length < N) {
           // Partial array — use what we got, mark the rest as missing
           progLog(`Batch ${chunkIdx+1}: got ${arr.length}/${N} objects, filling partial`);
-          chunk.rows.forEach((row, i) => {
-            const abs = chunk.start + i;
-            const obj = arr[i];
-            if (obj && typeof obj === "object") {
-              colNames.forEach(c => {
-                const v = obj[c];
-                row[c] = (v == null) ? "" : (typeof v === "string" ? v : JSON.stringify(v));
-                markCell(abs, c);
-              });
-            } else {
-              parseFailCount++;
-              row[colNames[0]] = "[missing in batch]";
-              markCell(abs, colNames[0]);
-            }
-            tickProg();
-          });
+          chunk.rows.forEach((row, i) => writeRow(row, i, arr[i]));
         } else {
           // ── Parse failed: fall back to one call per row for this chunk ──
           batchFallbackCount++;
-          if (batchFallbackCount <= 2) progLog(`Batch ${chunkIdx+1}: JSON parse failed, falling back to single-row (${N} extra calls)`);
+          if (batchFallbackCount <= 2) {
+            progLog(`Batch ${chunkIdx+1}: no JSON array found (got ${typeof arr}), falling back to single-row. Raw: ${ans.slice(0, 200)}`);
+          }
           for (let i = 0; i < N; i++) {
             if (!state.running) break;
             await processSingleRow(chunk.rows[i], chunk.start + i);
@@ -1265,6 +1303,10 @@ Return a JSON array of EXACTLY ${N} objects now (one per row, same order, keys =
     updateStep("ask-steps", 3, "done");
     renderRail();
     setStatus("Done", "ok");
+    // Force a full table repaint — cheap for <500 rows, silent-no-op for rows >500
+    renderTable();
+    persist();
+
     const okCount = rows.length - errCount - parseFailCount;
     const colLabel = multiCol ? `[${colNames.join(", ")}]` : `"${colNames[0]}"`;
     let msg = `Answered ${okCount}/${rows.length} rows → ${colLabel}`;
@@ -1272,7 +1314,26 @@ Return a JSON array of EXACTLY ${N} objects now (one per row, same order, keys =
     if (errCount) msg += ` · ${errCount} errors`;
     if (parseFailCount) msg += ` · ${parseFailCount} parse issues`;
     const apiCalls = chunks.length + batchFallbackCount * batchSize; // rough estimate
-    progLog(`Done · ~${apiCalls} API calls (vs ${rows.length} w/o batching · ${Math.round((1 - apiCalls/rows.length)*100)}% saved)`);
+    progLog(`Done · ~${apiCalls} API calls (vs ${rows.length} w/o batching · ${Math.round(Math.max(0, 1 - apiCalls/rows.length)*100)}% saved)`);
+
+    // Visible completion card with preview so user KNOWS it worked
+    const sample = rows.slice(0, 3).map((r, i) => {
+      const cells = colNames.map(c => `<td style="padding:4px 8px;border:1px solid var(--border);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(r[c]||"").slice(0,120))}</td>`).join("");
+      return `<tr><td style="padding:4px 8px;border:1px solid var(--border);color:var(--muted)">row ${i+1}</td>${cells}</tr>`;
+    }).join("");
+    const header = `<tr><th style="padding:4px 8px;border:1px solid var(--border);background:var(--bg2)">#</th>${colNames.map(c=>`<th style="padding:4px 8px;border:1px solid var(--border);background:var(--bg2)">${esc(c)}</th>`).join("")}</tr>`;
+    $("ask-out").innerHTML = `
+      <div class="card" style="border-color:${(errCount||parseFailCount)?'var(--err)':'var(--ok,#2ea043)'}">
+        <div style="font-weight:600;margin-bottom:6px">${(errCount||parseFailCount)?'⚠️':'✅'} ${esc(msg)}</div>
+        <div class="muted" style="font-size:12px;margin-bottom:8px">Batches: ${chunks.length} · batch size: ${batchSize} · API calls: ~${apiCalls} · cols written: ${colNames.length}</div>
+        <div style="overflow:auto"><table style="border-collapse:collapse;font-size:12px">${header}${sample}</table></div>
+        <div class="muted" style="font-size:12px;margin-top:8px">Scroll the main table below to see all rows. Use Download CSV / XLSX / Push to Sheet (top bar) to export.</div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn" onclick="downloadXLSX()">↓ Download XLSX</button>
+          <button class="btn sec" onclick="downloadCSV()">↓ Download CSV</button>
+          ${state.google.token ? '<button class="btn sec" onclick="go(\'export\')">↑ Push to Google Sheet</button>' : ''}
+        </div>
+      </div>`;
     toast(msg, (errCount || parseFailCount) ? "err" : "ok");
   } catch(e) {
     updateStep("ask-steps", 2, "err");
@@ -1682,6 +1743,9 @@ function renderTable() {
 }
 
 function markCell(rowIdx, colName) {
+  // Data is already written to state.data.rows before markCell is called.
+  // markCell only repaints the visible DOM for rows 0..499.
+  // A final renderTable() at end-of-run handles off-screen rows on export.
   if (rowIdx >= 500) return;
   const tr = document.querySelector(`tr[data-idx="${rowIdx}"]`);
   if (!tr) return;
@@ -1690,7 +1754,7 @@ function markCell(rowIdx, colName) {
     td.classList.add("added");
     td.textContent = String(state.data.rows[rowIdx][colName]||"").slice(0,300);
   } else {
-    // new column — just refresh header row
+    // new column hasn't been rendered into the table yet — repaint whole table
     renderTable();
   }
 }
