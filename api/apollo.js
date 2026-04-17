@@ -23,7 +23,7 @@ export default async function handler(req, res) {
   if (!apiKey) return res.status(400).json({ error: "Missing x-apollo-key header" });
 
   // Allow overriding endpoint for different Apollo APIs (default: people search)
-  const endpoint = req.headers["x-apollo-endpoint"] || "https://api.apollo.io/v1/mixed_people/search";
+  const endpoint = req.headers["x-apollo-endpoint"] || "https://api.apollo.io/api/v1/mixed_people/api_search";
 
   try {
     const upstream = await fetch(endpoint, {

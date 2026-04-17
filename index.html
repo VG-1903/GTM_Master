@@ -1633,12 +1633,16 @@ const PROVIDERS = {
     unitCost: { credits: 1, note: "Search is free; email reveal uses credits" },
     supports: q => !!(q.company || q.domain),
     async search(q, max) {
+      /* Apollo v2 api_search uses array-style param names */
       const body = {
         page: 1,
         per_page: Math.min(max, 25),
         person_seniorities: ["owner","founder","c_suite","partner","vp","head","director","manager"],
       };
-      if (q.domain) body.q_organization_domains = q.domain.replace(/^https?:\/\//,"").replace(/^www\./,"").split("/")[0];
+      if (q.domain) {
+        const d = q.domain.replace(/^https?:\/\//,"").replace(/^www\./,"").split("/")[0];
+        body.q_organization_domains_list = [d];
+      }
       if (q.company) body.q_organization_name = q.company;
 
       const r = await fetch("/api/apollo", {
@@ -1647,6 +1651,11 @@ const PROVIDERS = {
         body: JSON.stringify(body),
       });
       if (r.status === 401 || r.status === 403) throw new Error(`Apollo auth error HTTP ${r.status}`);
+      if (r.status === 422) {
+        const t = (await r.text()).slice(0, 300);
+        progLog(`Apollo 422: ${t}`);
+        return [];
+      }
       if (!r.ok) { progLog(`Apollo HTTP ${r.status}: ${(await r.text()).slice(0,150)}`); return []; }
       const d = await r.json();
       return (d.people || []).slice(0, max).map(p => normalizePerson({
