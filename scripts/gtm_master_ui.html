@@ -562,10 +562,10 @@ PANELS.keys = (el) => {
     fetcher: async () => {
       const key = cleanKey($("k-apollo").value);
       if (!key) return { ok:false, statusText:"Paste a key first" };
-      // Small search to validate — per_page:1, no real credit spend on search
-      const r = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+      // Small search to validate via proxy — per_page:1, no real credit spend
+      const r = await fetch("/api/apollo", {
         method:"POST",
-        headers:{ "Content-Type":"application/json", "Cache-Control":"no-cache", "X-Api-Key": key },
+        headers:{ "Content-Type":"application/json", "x-apollo-key": key },
         body: JSON.stringify({ per_page: 1, page: 1 }),
       });
       if (!r.ok) {
@@ -582,10 +582,10 @@ PANELS.keys = (el) => {
     fetcher: async () => {
       const key = cleanKey($("k-lusha").value);
       if (!key) return { ok:false, statusText:"Paste a key first" };
-      // Credits endpoint is the cheapest validity check
-      const r = await fetch("https://api.lusha.com/prospecting/contact/search", {
+      // Cheapest validity check via proxy
+      const r = await fetch("/api/lusha", {
         method:"POST",
-        headers:{ "Content-Type":"application/json", "api_key": key },
+        headers:{ "Content-Type":"application/json", "x-lusha-key": key },
         body: JSON.stringify({ pages:{page:0,size:1}, filters:{} }),
       });
       if (r.status === 401 || r.status === 403) return { ok:false, statusText:`HTTP ${r.status} — key invalid` };
@@ -1641,9 +1641,9 @@ const PROVIDERS = {
       if (q.domain) body.q_organization_domains = q.domain.replace(/^https?:\/\//,"").replace(/^www\./,"").split("/")[0];
       if (q.company) body.q_organization_name = q.company;
 
-      const r = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+      const r = await fetch("/api/apollo", {
         method: "POST",
-        headers: { "Content-Type":"application/json", "Cache-Control":"no-cache", "X-Api-Key": state.keys.apollo },
+        headers: { "Content-Type":"application/json", "x-apollo-key": state.keys.apollo },
         body: JSON.stringify(body),
       });
       if (r.status === 401 || r.status === 403) throw new Error(`Apollo auth error HTTP ${r.status}`);
@@ -1681,9 +1681,9 @@ const PROVIDERS = {
           },
         },
       };
-      const r = await fetch("https://api.lusha.com/prospecting/contact/search", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json", "api_key": state.keys.lusha },
+      const r = await fetch("/api/lusha", {
+        method: "POST",
+        headers: { "Content-Type":"application/json", "x-lusha-key": state.keys.lusha },
         body: JSON.stringify(body),
       });
       if (r.status === 401 || r.status === 403) throw new Error(`Lusha auth error HTTP ${r.status}`);
